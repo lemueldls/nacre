@@ -43,11 +43,9 @@ impl Launcher {
             let mut list = Vec::new();
             let paths = vec![
                 PathBuf::from("/usr/share/applications"),
-                // Add user local applications directory if HOME is set
-                std::env::var_os("HOME").map_or_else(
-                    || PathBuf::from("/home/lemuel/.local/share/applications"),
-                    |home| PathBuf::from(home).join(".local/share/applications"),
-                ),
+                dirs::data_dir()
+                    .expect("Failed to get data directory")
+                    .join("applications"),
             ];
 
             for path in paths {

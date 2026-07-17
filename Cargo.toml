@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 ammonia = "4.1.3"
 cosmic-text = "0.19.0"
+dirs = "6.0.0"
 facet = "0.50.0-rc.5"
 facet-default = "0.50.0-rc.5"
 facet-json = "0.50.0-rc.5"
@@ -16,15 +17,16 @@ libc = "0.2"
 nix = { version = "0.31.3", features = ["fs", "process", "user"] }
 nucleo-matcher = "0.3.1"
 pam-sys = "1.0.0-alpha5"
+pollster = "1.0.1"
+raw-window-handle = "0.6.2"
 smithay-client-toolkit = "0.20.0"
 taffy = "0.12.2"
-tokio = { version = "1.52", features = ["full"] }
+tokio = { version = "1.53", features = ["full"] }
 tracing = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 vello = "0.9.0"
 wasmtime = "46"
-wayland-client = "0.31"
-wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
-wgpu = "30"
-winit = "0.30"
-zbus = { version = "5", features = ["tokio"] }
+wayland-backend = { version = "0.3.15", features = ["client_system", "rwh_06"] }
+wayland-client = { version = "0.31.14", features = ["system"] }
+wayland-protocols = { version = "0.32.13", features = ["client", "staging"] }
+zbus = { version = "5.18.0", features = ["tokio"] }

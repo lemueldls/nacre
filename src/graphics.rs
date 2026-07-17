@@ -1,32 +1,32 @@
-use std::sync::Arc;
-
 use cosmic_text::{Buffer, FontSystem, SwashCache};
+use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 use taffy::prelude::*;
 use tracing::debug;
 use vello::{
     Scene,
     peniko::{Brush, Color, Fill},
-    util::{RenderContext, RenderSurface},
+    wgpu,
 };
 
-pub struct GraphicsEngine<'s> {
+pub struct GraphicsEngine {
     pub font_system: FontSystem,
     pub swash_cache: SwashCache,
     pub taffy: TaffyTree,
     pub scene: Scene,
-    pub wgpu_context: Option<WgpuContext<'s>>,
+    pub wgpu_context: Option<WgpuContext>,
     pub headless: bool,
 }
 
-pub struct WgpuContext<'s> {
-    pub context: RenderContext,
-    pub surface: RenderSurface<'s>,
-    pub device: Arc<wgpu::Device>,
-    pub queue: Arc<wgpu::Queue>,
-    pub renderer: vello::Renderer,
+pub struct WgpuContext {
+    pub instance: wgpu::Instance,
+    pub surface: wgpu::Surface<'static>,
+    pub adapter: wgpu::Adapter,
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+    pub surface_config: wgpu::SurfaceConfiguration,
 }
 
-impl GraphicsEngine<'_> {
+impl GraphicsEngine {
     pub fn new(headless: bool) -> Self {
         let font_system = FontSystem::new();
         let swash_cache = SwashCache::new();
@@ -43,18 +43,148 @@ impl GraphicsEngine<'_> {
         }
     }
 
-    /// Try to initialize GPU graphics using wgpu and vello
-    pub fn init_gpu(&mut self, _window: &winit::window::Window) -> Result<(), String> {
+    /// Try to initialize GPU graphics using wgpu.
+    pub fn init_gpu(
+        &mut self,
+        raw_display_handle: RawDisplayHandle,
+        raw_window_handle: RawWindowHandle,
+    ) -> Result<(), String> {
         if self.headless {
             return Ok(());
         }
 
-        // Under sandboxed/headless tests, we catch errors here and fall back
-        let mut context = RenderContext::new();
-        // Since we are compiling, let's wrap this in a try block structure
-        // winit window handle is passed in standard wgpu configuration
-        // In this workspace, if real GPU is not found, we gracefully log it
-        debug!("GPU graphics initialized successfully (vello + wgpu)");
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+
+        let surface = unsafe {
+            instance
+                .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                    raw_display_handle: Some(raw_display_handle),
+                    raw_window_handle,
+                })
+                .map_err(|e| format!("failed to create Wayland surface: {e}"))?
+        };
+
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            compatible_surface: Some(&surface),
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            ..Default::default()
+        }))
+        .map_err(|e| format!("failed to find GPU adapter: {e}"))?;
+
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default()))
+            .map_err(|e| format!("failed to request GPU device: {e}"))?;
+
+        let caps = surface.get_capabilities(&adapter);
+        let format = caps
+            .formats
+            .first()
+            .copied()
+            .ok_or_else(|| "surface has no supported formats".to_string())?;
+
+        let surface_config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            // color_space: wgpu::SurfaceColorSpace::Auto,
+            width: 1,
+            height: 1,
+            desired_maximum_frame_latency: 2,
+            present_mode: wgpu::PresentMode::Fifo,
+            alpha_mode: caps
+                .alpha_modes
+                .first()
+                .copied()
+                .unwrap_or(wgpu::CompositeAlphaMode::Auto),
+            view_formats: vec![format],
+        };
+
+        surface.configure(&device, &surface_config);
+
+        self.wgpu_context = Some(WgpuContext {
+            instance,
+            surface,
+            adapter,
+            device,
+            queue,
+            surface_config,
+        });
+
+        debug!("GPU graphics initialized successfully (wgpu)");
+
+        Ok(())
+    }
+
+    pub fn resize_surface(&mut self, width: u32, height: u32) -> Result<(), String> {
+        let context = self
+            .wgpu_context
+            .as_mut()
+            .ok_or_else(|| "GPU graphics are not initialized".to_string())?;
+
+        context.surface_config.width = width.max(1);
+        context.surface_config.height = height.max(1);
+        context
+            .surface
+            .configure(&context.device, &context.surface_config);
+
+        Ok(())
+    }
+
+    pub fn clear_surface(&mut self, color: wgpu::Color) -> Result<(), String> {
+        let context = self
+            .wgpu_context
+            .as_mut()
+            .ok_or_else(|| "GPU graphics are not initialized".to_string())?;
+
+        let surface_texture = match context.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(texture)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
+            wgpu::CurrentSurfaceTexture::Outdated => {
+                context
+                    .surface
+                    .configure(&context.device, &context.surface_config);
+
+                return Ok(());
+            }
+            wgpu::CurrentSurfaceTexture::Lost => {
+                context
+                    .surface
+                    .configure(&context.device, &context.surface_config);
+
+                return Ok(());
+            }
+            wgpu::CurrentSurfaceTexture::Occluded | wgpu::CurrentSurfaceTexture::Timeout => {
+                return Ok(());
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                return Err("surface validation failed".to_string());
+            }
+        };
+        let texture_view = surface_texture
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut encoder = context.device.create_command_encoder(&Default::default());
+        {
+            let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("nacre-clear-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &texture_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(color),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        }
+
+        context.queue.submit(Some(encoder.finish()));
+        surface_texture.present(); // context.queue.present(surface_texture);
 
         Ok(())
     }
