@@ -2518,12 +2518,15 @@ dependencies = [
  "figue",
  "image",
  "libc",
+ "niri-ipc",
  "nix",
  "nucleo-matcher",
  "pam-sys",
  "pollster",
  "raw-window-handle",
+ "serde_json",
  "smithay-client-toolkit",
+ "swash",
  "taffy",
  "tokio",
  "tracing",
@@ -2576,6 +2579,16 @@ name = "new_debug_unreachable"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
+
+[[package]]
+name = "niri-ipc"
+version = "26.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a4adbddf4037ce047854d36a60b5bf80a7990b8db2f0a0b9ede7534b0bae09a"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "nix"

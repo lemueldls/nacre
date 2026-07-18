@@ -1,11 +1,13 @@
-use std::{env, path::PathBuf};
+use std::{collections::HashMap, env, path::PathBuf};
 
+use niri_ipc::{Event, Reply, Request, Window, Workspace};
 use tokio::{
     fs,
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
     sync::mpsc,
 };
+use tracing::warn;
 
 use crate::ipc::{CompositorEvent, CompositorIpc, CompositorState, WorkspaceInfo};
 
@@ -42,6 +44,101 @@ impl NiriIpc {
     }
 }
 
+/// Tracks the subset of niri's compositor state the bar cares about, built up
+/// purely from the event stream.
+///
+/// Per the niri-ipc docs, the event stream always sends the full current state
+/// up front (the first `Event::WorkspacesChanged`/`WindowsChanged` contain
+/// everything, not a diff), so there's no need to separately send
+/// `Request::Workspaces`/`Request::Windows` to seed this before subscribing.
+#[derive(Default)]
+struct NiriState {
+    workspaces: Vec<Workspace>,
+    windows: HashMap<u64, Window>,
+    focused_window_id: Option<u64>,
+}
+
+impl NiriState {
+    fn apply(&mut self, event: Event) {
+        match event {
+            Event::WorkspacesChanged { workspaces } => {
+                self.workspaces = workspaces;
+            }
+            Event::WorkspaceActivated { id, focused } => {
+                // Every output has exactly one active workspace; only one
+                // workspace across all outputs is ever focused.
+                let output = self
+                    .workspaces
+                    .iter()
+                    .find(|w| w.id == id)
+                    .and_then(|w| w.output.clone());
+
+                for ws in &mut self.workspaces {
+                    if ws.output == output {
+                        ws.is_active = ws.id == id;
+                    }
+                    if focused {
+                        ws.is_focused = ws.id == id;
+                    }
+                }
+            }
+            Event::WorkspaceActiveWindowChanged {
+                workspace_id,
+                active_window_id,
+            } => {
+                if let Some(ws) = self.workspaces.iter_mut().find(|w| w.id == workspace_id) {
+                    ws.active_window_id = active_window_id;
+                }
+            }
+            Event::WindowsChanged { windows } => {
+                self.windows = windows.into_iter().map(|w| (w.id, w)).collect();
+            }
+            Event::WindowOpenedOrChanged { window } => {
+                self.windows.insert(window.id, window);
+            }
+            Event::WindowClosed { id } => {
+                self.windows.remove(&id);
+                if self.focused_window_id == Some(id) {
+                    self.focused_window_id = None;
+                }
+            }
+            Event::WindowFocusChanged { id } => {
+                self.focused_window_id = id;
+            }
+            _ => {
+                // Keyboard layout, overview, screenshot, cast, and config
+                // events don't affect bar state. Falling through here
+                // (rather than matching every variant) also means new
+                // event variants added in a future niri-ipc patch bump
+                // won't fail to compile against this match.
+            }
+        }
+    }
+
+    fn focused_window_title(&self) -> Option<String> {
+        self.focused_window_id
+            .and_then(|id| self.windows.get(&id))
+            .and_then(|w| w.title.clone())
+    }
+
+    fn workspace_infos(&self) -> Vec<WorkspaceInfo> {
+        self.workspaces
+            .iter()
+            .map(|ws| {
+                WorkspaceInfo {
+                    id: ws.id.to_string(),
+                    name: ws.name.clone().unwrap_or_else(|| ws.idx.to_string()),
+                    is_active: ws.is_active,
+                    is_focused: ws.is_focused,
+                    // niri doesn't expose "empty" directly on `Workspace`; a
+                    // workspace with no active window has no windows on it.
+                    is_empty: ws.active_window_id.is_none(),
+                }
+            })
+            .collect()
+    }
+}
+
 impl CompositorIpc for NiriIpc {
     fn run(
         &self,
@@ -57,23 +154,45 @@ impl CompositorIpc for NiriIpc {
             let (reader, mut writer) = stream.into_split();
             let mut reader = BufReader::new(reader);
 
-            // Subscribe to event stream: Send "EventStream"\n (or JSON request format)
-            // In niri-ipc, request is serialized as simple string for Unit variant:
-            // "EventStream"
+            // Requests are one JSON value per line. `Request::EventStream` is a
+            // unit variant, so it serializes to the bare JSON string "EventStream"
+            let request = serde_json::to_string(&Request::EventStream)
+                .map_err(|e| format!("Failed to serialize EventStream request: {}", e))?;
             writer
-                .write_all(b"\"EventStream\"\n")
+                .write_all(request.as_bytes())
                 .await
-                .map_err(|e| format!("Failed to send subscribe request: {}", e))?;
+                .map_err(|e| format!("Failed to send EventStream request: {}", e))?;
+            writer
+                .write_all(b"\n")
+                .await
+                .map_err(|e| format!("Failed to send EventStream request: {}", e))?;
             writer
                 .flush()
                 .await
-                .map_err(|e| format!("Failed to flush stream: {}", e))?;
+                .map_err(|e| format!("Failed to flush Niri socket: {}", e))?;
 
+            // Niri replies once to the EventStream request itself (normally
+            // `Response::Handled`) before it starts pushing events on the
+            // same connection.
             let mut line = String::new();
-            let mut current_state = CompositorState {
-                workspaces: vec![],
-                active_window_title: None,
-            };
+            reader
+                .read_line(&mut line)
+                .await
+                .map_err(|e| format!("Failed to read EventStream reply: {}", e))?;
+
+            let reply: Reply = serde_json::from_str(&line).map_err(|e| {
+                format!(
+                    "Failed to parse EventStream reply: {} (line: {})",
+                    e,
+                    line.trim()
+                )
+            })?;
+
+            if let Err(err) = reply {
+                return Err(format!("Niri rejected EventStream request: {}", err));
+            }
+
+            let mut state = NiriState::default();
 
             loop {
                 line.clear();
@@ -86,72 +205,29 @@ impl CompositorIpc for NiriIpc {
                     break; // Connection closed
                 }
 
-                // Parse the line. Niri returns JSON lines.
-                // We'll search for WorkspacesChanged / WindowFocusChanged key details.
-                // Doing string-based detection makes our parsing highly robust to minor Niri
-                // version differences.
-                if line.contains("WorkspacesChanged") {
-                    // Extract workspaces details
-                    let mut workspaces = Vec::new();
-                    // Basic JSON parser helper: look for workspace entries
-                    // Each workspace has fields: id, name, is_active, is_focused, is_empty
-                    // Let's do a simple regex-like extraction or substring scanning.
-                    // This avoids failing due to minor schema or enum changes.
-                    let w_blocks: Vec<&str> = line.split("{\"id\"").collect();
-                    for block in w_blocks.iter().skip(1) {
-                        let id = block
-                            .split(",")
-                            .next()
-                            .unwrap_or("")
-                            .trim_matches(|c| c == ':' || c == '"' || c == ' ');
-                        let name = if let Some(n_part) = block.split("\"name\":").nth(1) {
-                            n_part
-                                .split(",")
-                                .next()
-                                .unwrap_or("")
-                                .trim_matches(|c| c == '"' || c == ' ' || c == '}')
-                        } else {
-                            id
-                        };
-                        let is_active = block.contains("\"is_active\":true")
-                            || block.contains("\"active\":true");
-                        let is_focused = block.contains("\"is_focused\":true")
-                            || block.contains("\"focused\":true");
-                        let is_empty =
-                            block.contains("\"is_empty\":true") || block.contains("\"empty\":true");
+                let event: Event = match serde_json::from_str(&line) {
+                    Ok(event) => event,
+                    Err(err) => {
+                        // Most likely this pinned niri-ipc version doesn't know
+                        // about an event variant a newer niri sent. Skip it
+                        // rather than tearing down the connection.
+                        warn!(
+                            "Failed to parse Niri event, skipping (niri newer than pinned niri-ipc?): {} (line: {})",
+                            err,
+                            line.trim()
+                        );
+                        continue;
+                    }
+                };
 
-                        workspaces.push(WorkspaceInfo {
-                            id: id.to_string(),
-                            name: name.to_string(),
-                            is_active,
-                            is_focused,
-                            is_empty,
-                        });
-                    }
+                state.apply(event);
 
-                    if !workspaces.is_empty() {
-                        current_state.workspaces = workspaces;
-                        let _ = sender.send(CompositorEvent::StateChanged(current_state.clone()));
-                    }
-                } else if line.contains("WindowFocusChanged")
-                    || line.contains("FocusedWindowChanged")
-                {
-                    // Extract title
-                    if let Some(t_part) = line.split("\"title\":").nth(1) {
-                        let title = t_part
-                            .split(",")
-                            .next()
-                            .unwrap_or("null")
-                            .trim_matches(|c| c == '"' || c == ' ' || c == '}' || c == ']');
-                        let title_opt = if title == "null" {
-                            None
-                        } else {
-                            Some(title.to_string())
-                        };
-                        current_state.active_window_title = title_opt;
-                        let _ = sender.send(CompositorEvent::StateChanged(current_state.clone()));
-                    }
-                }
+                let compositor_state = CompositorState {
+                    workspaces: state.workspace_infos(),
+                    active_window_title: state.focused_window_title(),
+                };
+
+                let _ = sender.send(CompositorEvent::StateChanged(compositor_state));
             }
 
             Ok(())

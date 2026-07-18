@@ -3,6 +3,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use tokio::sync::mpsc::UnboundedSender;
+use tracing::{error, info, warn};
 use zbus::{interface, zvariant::Value};
 
 #[derive(Debug, Clone)]
@@ -24,7 +26,7 @@ pub enum NotificationEvent {
 
 pub struct NotificationServer {
     next_id: Arc<Mutex<u32>>,
-    sender: tokio::sync::mpsc::UnboundedSender<NotificationEvent>,
+    sender: UnboundedSender<NotificationEvent>,
 }
 
 #[interface(name = "org.freedesktop.Notifications")]
@@ -52,8 +54,8 @@ impl NotificationServer {
             replaces_id
         };
 
-        // Use ammonia to parse and sanitize the HTML body text, stripping tags like
-        // script, iframe, etc.
+        // Use ammonia to parse and sanitize the HTML body text, stripping tags
+        // like script, iframe, etc.
         let sanitized_body = ammonia::clean(&body);
 
         // Normalize expire timeout
@@ -74,6 +76,7 @@ impl NotificationServer {
         };
 
         let _ = self.sender.send(NotificationEvent::Add(item));
+
         id
     }
 
@@ -92,7 +95,7 @@ impl NotificationServer {
 }
 
 /// Start D-Bus server session. Falls back gracefully if D-Bus is not running.
-pub async fn start_dbus_server(sender: tokio::sync::mpsc::UnboundedSender<NotificationEvent>) {
+pub async fn start_dbus_server(sender: UnboundedSender<NotificationEvent>) {
     let server = NotificationServer {
         next_id: Arc::new(Mutex::new(0)),
         sender,
@@ -106,27 +109,27 @@ pub async fn start_dbus_server(sender: tokio::sync::mpsc::UnboundedSender<Notifi
                         Ok(served_builder) => {
                             match served_builder.build().await {
                                 Ok(_conn) => {
-                                    println!(
+                                    info!(
                                         "D-Bus Notification Server published on org.freedesktop.Notifications"
                                     );
                                     return;
                                 }
-                                Err(e) => println!("Failed to build D-Bus connection: {}", e),
+                                Err(e) => error!("Failed to build D-Bus connection: {}", e),
                             }
                         }
-                        Err(e) => println!("Failed to register D-Bus path: {}", e),
+                        Err(e) => error!("Failed to register D-Bus path: {}", e),
                     }
                 }
                 Err(e) => {
-                    println!(
+                    error!(
                         "Failed to request D-Bus name org.freedesktop.Notifications: {}",
                         e
                     )
                 }
             }
         }
-        Err(e) => println!("Failed to connect to D-Bus session bus: {}", e),
+        Err(e) => error!("Failed to connect to D-Bus session bus: {}", e),
     }
 
-    println!("Warning: D-Bus notification daemon running in Mock/No-DBus fallback mode");
+    warn!("D-Bus notification daemon running in Mock/No-DBus fallback mode");
 }

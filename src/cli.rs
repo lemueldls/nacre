@@ -106,7 +106,7 @@ pub async fn from_std_args() -> Result<(), Box<dyn std::error::Error>> {
         };
 
     // Initialize shell modules
-    let bar_manager = Arc::new(bar::BarManager::new());
+    let bar_manager = Arc::new(bar::BarManager::new(&config.bar));
     bar_manager.start_polling();
 
     let _launcher_manager = Arc::new(launcher::Launcher::new());

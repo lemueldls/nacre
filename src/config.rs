@@ -22,6 +22,44 @@ pub struct ThemeConfig {
     pub background_blur: BackgroundBlurConfig,
     #[facet(rename = "accent-color", default = "#ff007f")]
     pub accent_color: String,
+    pub material: MaterialConfig,
+    pub shape: ShapeConfig,
+    pub colorway: ColorwayConfig,
+    #[facet(rename = "reduced-motion", default = false)]
+    pub reduced_motion: bool,
+    #[facet(rename = "reduced-transparency", default = false)]
+    pub reduced_transparency: bool,
+}
+
+#[repr(u8)]
+#[derive(Facet, Debug, Clone, PartialEq, Eq)]
+#[facet(derive(Default), rename_all = "kebab-case")]
+pub enum MaterialConfig {
+    #[facet(default::variant)]
+    Flat,
+    FrostedGlass,
+    LiquidGlass,
+}
+
+#[repr(u8)]
+#[derive(Facet, Debug, Clone, PartialEq, Eq)]
+#[facet(derive(Default), rename_all = "kebab-case")]
+pub enum ShapeConfig {
+    #[facet(default::variant)]
+    RoundedRect,
+    SpacedPills,
+    SharpCorners,
+    FluidMorph,
+}
+
+#[repr(u8)]
+#[derive(Facet, Debug, Clone, PartialEq, Eq)]
+#[facet(derive(Default), rename_all = "kebab-case")]
+pub enum ColorwayConfig {
+    #[facet(default::variant)]
+    Accent,
+    HoloWhite,
+    Obsidian,
 }
 
 #[derive(Facet, Debug, Clone)]
@@ -199,27 +237,32 @@ mod tests {
                     intensity 0.8
                 }
                 accent-color #ff007f
+                material @frosted-glass
+                shape @spaced-pills
+                colorway @holo-white
+                reduced-motion false
+                reduced-transparency false
             }
             bar {
-                position top
+                position @top
                 height 32
                 modules (
-                    { type workspaces, align start }
-                    { type title, align center }
-                    { type system-info, align end }
-                    { type plugin, id weather-widget, align end }
+                    { type @workspaces, align @start }
+                    { type @title, align @center }
+                    { type @system-info, align @end }
+                    { type @plugin, id weather-widget, align @end }
                 )
             }
             launcher {
                 hotkey Super+D
                 show-icons true
-                fuzzy-match smart-case
+                fuzzy-match @smart-case
             }
             notifications {
                 timeout 5000
                 max-visible 5
-                anchor top-right
-                on-click dismiss
+                anchor @top-right
+                on-click @dismiss
             }
             lock {
                 blur-background true
@@ -242,6 +285,11 @@ mod tests {
         assert_eq!(config.theme.background_blur.radius, 15.0);
         assert_eq!(config.theme.background_blur.intensity, 0.8);
         assert_eq!(config.theme.accent_color, "#ff007f");
+        assert_eq!(config.theme.material, MaterialConfig::FrostedGlass);
+        assert_eq!(config.theme.shape, ShapeConfig::SpacedPills);
+        assert_eq!(config.theme.colorway, ColorwayConfig::HoloWhite);
+        assert!(!config.theme.reduced_motion);
+        assert!(!config.theme.reduced_transparency);
 
         assert_eq!(config.bar.position, BarConfigPosition::Top);
         assert_eq!(config.bar.height, 32);

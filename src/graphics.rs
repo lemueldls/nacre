@@ -1,9 +1,15 @@
 use cosmic_text::{Buffer, FontSystem, SwashCache};
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
+use swash::{
+    FontRef,
+    scale::ScaleContext,
+    zeno::{Command, PathData},
+};
 use taffy::prelude::*;
 use tracing::debug;
 use vello::{
     Scene,
+    kurbo::{Affine, BezPath},
     peniko::{Brush, Color, Fill},
     wgpu,
 };
@@ -15,6 +21,10 @@ pub struct GraphicsEngine {
     pub scene: Scene,
     pub wgpu_context: Option<WgpuContext>,
     pub headless: bool,
+    /// Scratch state for extracting glyph outlines (see `draw_text`).
+    /// Reused across calls rather than created per-call, since that's what
+    /// makes repeated scaling of the same glyphs cheap.
+    outline_context: ScaleContext,
 }
 
 pub struct WgpuContext {
@@ -40,6 +50,7 @@ impl GraphicsEngine {
             scene,
             wgpu_context: None,
             headless,
+            outline_context: ScaleContext::new(),
         }
     }
 
@@ -201,7 +212,16 @@ impl GraphicsEngine {
         );
     }
 
-    /// Draw shaped text using Cosmic-Text layout and glyph translation
+    /// Draw shaped text using cosmic-text layout with real glyph outlines,
+    /// filled through vello as vector paths (replaces the old
+    /// placeholder-rectangle fallback).
+    ///
+    /// For each shaped glyph, this pulls the owning font's raw bytes out of
+    /// cosmic-text's `fontdb`, asks `swash` to scale that glyph to an
+    /// outline at the run's font size, and converts swash's path commands
+    /// into a `kurbo::BezPath` that vello fills directly. Glyphs with no
+    /// outline available (e.g. bitmap-only emoji fonts) are skipped rather
+    /// than drawn as a placeholder shape.
     pub fn draw_text(&mut self, x: f32, y: f32, text: &str, font_size: f32, color: Color) {
         let mut buffer = Buffer::new(
             &mut self.font_system,
@@ -215,27 +235,65 @@ impl GraphicsEngine {
         );
         buffer.shape_until_scroll(&mut self.font_system, false);
 
+        let db = self.font_system.db();
+
         for run in buffer.layout_runs() {
             for glyph in run.glyphs {
-                // Here we would typically render glyph outlines with vello kurbo path or
-                // fallback rendering. In this unified implementation, we draw a
-                // solid character bounding block as visual fallback,
-                // or paint paths if cache/outlines are loaded.
-                let glyph_x = x + glyph.x;
-                let glyph_y = y + run.line_y + glyph.y;
-                // To keep compile simple, draw placeholder rects or lines
-                let rect = vello::kurbo::Rect::new(
-                    glyph_x as f64,
-                    (glyph_y - font_size * 0.8) as f64,
-                    (glyph_x + font_size * 0.5) as f64,
-                    glyph_y as f64,
-                );
+                let glyph_x = (x + glyph.x) as f64;
+                // Baseline for this run, in the same top-down screen space
+                // `draw_rect` uses.
+                let baseline_y = (y + run.line_y + glyph.y) as f64;
+
+                let outline = db.with_face_data(glyph.font_id, |font_data, face_index| {
+                    let font_ref = FontRef::from_index(font_data, face_index as usize)?;
+                    let mut scaler = self
+                        .outline_context
+                        .builder(font_ref)
+                        .size(glyph.font_size)
+                        .hint(true)
+                        .build();
+                    scaler.scale_outline(glyph.glyph_id)
+                });
+
+                let Some(Some(outline)) = outline else {
+                    continue;
+                };
+
+                let mut path = BezPath::new();
+                // swash outlines are in font space with +y pointing up;
+                // screen space here has +y pointing down, so y is
+                // subtracted from the baseline rather than added.
+                for command in outline.path().commands() {
+                    match command {
+                        Command::MoveTo(p) => {
+                            path.move_to((glyph_x + p.x as f64, baseline_y - p.y as f64))
+                        }
+                        Command::LineTo(p) => {
+                            path.line_to((glyph_x + p.x as f64, baseline_y - p.y as f64))
+                        }
+                        Command::QuadTo(c, p) => {
+                            path.quad_to(
+                                (glyph_x + c.x as f64, baseline_y - c.y as f64),
+                                (glyph_x + p.x as f64, baseline_y - p.y as f64),
+                            )
+                        }
+                        Command::CurveTo(c1, c2, p) => {
+                            path.curve_to(
+                                (glyph_x + c1.x as f64, baseline_y - c1.y as f64),
+                                (glyph_x + c2.x as f64, baseline_y - c2.y as f64),
+                                (glyph_x + p.x as f64, baseline_y - p.y as f64),
+                            )
+                        }
+                        Command::Close => path.close_path(),
+                    }
+                }
+
                 self.scene.fill(
                     Fill::NonZero,
-                    vello::kurbo::Affine::IDENTITY,
+                    Affine::IDENTITY,
                     &Brush::Solid(color),
                     None,
-                    &rect,
+                    &path,
                 );
             }
         }

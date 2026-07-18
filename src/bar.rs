@@ -1,14 +1,17 @@
 use std::{
     fs::File,
     io::{BufRead, BufReader},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use tokio::time;
 
-use crate::ipc::WorkspaceInfo;
+use crate::{
+    config::{BarConfig, BarModuleConfig, BarModuleConfigAlign, BarModuleConfigType},
+    ipc::WorkspaceInfo,
+};
 
 #[derive(Debug, Clone)]
 pub struct BarState {
@@ -35,14 +38,43 @@ impl Default for BarState {
     }
 }
 
+/// A single configured bar module, resolved against current runtime state.
+/// Renderers should iterate `BarManager::visible_modules` (or
+/// `modules_by_alignment`) rather than assuming a fixed module set.
+#[derive(Debug, Clone)]
+pub struct ResolvedModule {
+    pub config: BarModuleConfig,
+    pub value: ModuleValue,
+}
+
+#[derive(Debug, Clone)]
+pub enum ModuleValue {
+    Workspaces(Vec<WorkspaceInfo>),
+    Title(Option<String>),
+    SystemInfo {
+        time_str: String,
+        cpu_pct: f32,
+        mem_pct: f32,
+        battery_pct: Option<f32>,
+        battery_charging: bool,
+    },
+    /// Plugin modules aren't fed live data yet. The module still
+    /// resolves so layout/rendering can reserve space for it.
+    Plugin {
+        id: Option<String>,
+    },
+}
+
 pub struct BarManager {
     pub state: Arc<Mutex<BarState>>,
+    modules: Vec<BarModuleConfig>,
 }
 
 impl BarManager {
-    pub fn new() -> Self {
+    pub fn new(bar_config: &BarConfig) -> Self {
         Self {
             state: Arc::new(Mutex::new(BarState::default())),
+            modules: bar_config.modules.clone(),
         }
     }
 
@@ -125,11 +157,11 @@ impl BarManager {
                     }
                 }
 
-                // Read battery metrics from /sys/class/power_supply/BAT0
+                // Read battery metrics. Naming varies (BAT0, BAT1, ...)
+                // across hardware, so glob rather than hardcode.
                 let mut battery_pct = None;
                 let mut battery_charging = false;
-                let bat_path = Path::new("/sys/class/power_supply/BAT0");
-                if bat_path.exists() {
+                if let Some(bat_path) = find_battery() {
                     if let Ok(cap_str) = std::fs::read_to_string(bat_path.join("capacity")) {
                         if let Ok(cap) = cap_str.trim().parse::<f32>() {
                             battery_pct = Some(cap);
@@ -159,4 +191,82 @@ impl BarManager {
         lock.workspaces = workspaces;
         lock.active_window_title = title;
     }
+
+    /// Resolves `config.bar.modules` against current state, in configured
+    /// order. Call this once per redraw; it takes one short-lived lock and
+    /// only clones what's needed for that frame.
+    pub fn visible_modules(&self) -> Vec<ResolvedModule> {
+        let state = self.state.lock().unwrap();
+        self.modules
+            .iter()
+            .map(|module_config| {
+                let value = match module_config.module_type.clone() {
+                    BarModuleConfigType::Workspaces => {
+                        ModuleValue::Workspaces(state.workspaces.clone())
+                    }
+                    BarModuleConfigType::Title => {
+                        ModuleValue::Title(state.active_window_title.clone())
+                    }
+                    BarModuleConfigType::SystemInfo => {
+                        ModuleValue::SystemInfo {
+                            time_str: state.time_str.clone(),
+                            cpu_pct: state.cpu_pct,
+                            mem_pct: state.mem_pct,
+                            battery_pct: state.battery_pct,
+                            battery_charging: state.battery_charging,
+                        }
+                    }
+                    BarModuleConfigType::Plugin => {
+                        ModuleValue::Plugin {
+                            id: module_config.id.clone(),
+                        }
+                    }
+                };
+
+                ResolvedModule {
+                    config: module_config.clone(),
+                    value,
+                }
+            })
+            .collect()
+    }
+
+    /// `visible_modules()` split into start/center/end groups, which is
+    /// normally what a layout pass wants directly.
+    pub fn modules_by_alignment(
+        &self,
+    ) -> (
+        Vec<ResolvedModule>,
+        Vec<ResolvedModule>,
+        Vec<ResolvedModule>,
+    ) {
+        let mut start = Vec::new();
+        let mut center = Vec::new();
+        let mut end = Vec::new();
+
+        for module in self.visible_modules() {
+            match module.config.align.clone() {
+                BarModuleConfigAlign::Start => start.push(module),
+                BarModuleConfigAlign::Center => center.push(module),
+                BarModuleConfigAlign::End => end.push(module),
+            }
+        }
+
+        (start, center, end)
+    }
+}
+
+fn find_battery() -> Option<PathBuf> {
+    let power_supply = Path::new("/sys/class/power_supply");
+    let entries = std::fs::read_dir(power_supply).ok()?;
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+
+        if name.to_string_lossy().starts_with("BAT") {
+            return Some(entry.path());
+        }
+    }
+
+    None
 }

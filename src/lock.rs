@@ -18,19 +18,19 @@ unsafe extern "C" fn pam_conversation_fn(
     }
 
     let password_ptr = appdata_ptr as *const c_char;
-    let resp_slice =
-        libc::calloc(num_msg as usize, std::mem::size_of::<pam_response>()) as *mut pam_response;
+    let resp_slice = unsafe { libc::calloc(num_msg as usize, std::mem::size_of::<pam_response>()) }
+        as *mut pam_response;
     if resp_slice.is_null() {
         return PAM_BUF_ERR;
     }
 
-    let msgs = std::slice::from_raw_parts(msg, num_msg as usize);
-    let resps = std::slice::from_raw_parts_mut(resp_slice, num_msg as usize);
+    let msgs = unsafe { std::slice::from_raw_parts(msg, num_msg as usize) };
+    let resps = unsafe { std::slice::from_raw_parts_mut(resp_slice, num_msg as usize) };
 
     for i in 0..(num_msg as usize) {
-        let msg_ref = &*msgs[i];
+        let msg_ref = unsafe { &*msgs[i] };
         if msg_ref.msg_style == PAM_PROMPT_ECHO_OFF || msg_ref.msg_style == PAM_PROMPT_ECHO_ON {
-            resps[i].resp = libc::strdup(password_ptr);
+            resps[i].resp = unsafe { libc::strdup(password_ptr) };
             resps[i].resp_retcode = 0;
         } else {
             resps[i].resp = std::ptr::null_mut();
@@ -39,6 +39,7 @@ unsafe extern "C" fn pam_conversation_fn(
     }
 
     *resp = resp_slice;
+
     PAM_SUCCESS
 }
 
@@ -79,8 +80,8 @@ pub fn authenticate_pam(username: &str, password: &str) -> Result<bool, String> 
     }
 }
 
-/// Helper method to spawn the screen locker in an isolated, robust subcommand
-/// process
+/// Helper method to spawn the screen locker in an isolated, robust
+/// subcommand process
 pub fn spawn_robust_locker() -> Result<std::process::Child, String> {
     let current_exe =
         std::env::current_exe().map_err(|e| format!("Failed to find current executable: {}", e))?;
