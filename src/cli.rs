@@ -106,7 +106,7 @@ pub async fn from_std_args() -> Result<(), Box<dyn std::error::Error>> {
         };
 
     // Initialize shell modules
-    let bar_manager = Arc::new(bar::BarManager::new(&config.bar));
+    let bar_manager = Arc::new(bar::BarManager::new(config.bar.clone()));
     bar_manager.start_polling();
 
     let _launcher_manager = Arc::new(launcher::Launcher::new());
@@ -215,6 +215,10 @@ pub async fn from_std_args() -> Result<(), Box<dyn std::error::Error>> {
             exit: false,
             width: 1,
             height: 1,
+            bar_manager: bar_manager.clone(),
+            bar_config: config.bar.clone(),
+            font_size: config.theme.font.size,
+            accent_color: graphics::parse_hex_color(&config.theme.accent_color),
         };
 
         shell

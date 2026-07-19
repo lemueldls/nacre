@@ -1,3 +1,5 @@
+pub mod render;
+
 use std::{
     fs::File,
     io::{BufRead, BufReader},
@@ -67,14 +69,14 @@ pub enum ModuleValue {
 
 pub struct BarManager {
     pub state: Arc<Mutex<BarState>>,
-    modules: Vec<BarModuleConfig>,
+    pub config: BarConfig,
 }
 
 impl BarManager {
-    pub fn new(bar_config: &BarConfig) -> Self {
+    pub fn new(bar_config: BarConfig) -> Self {
         Self {
             state: Arc::new(Mutex::new(BarState::default())),
-            modules: bar_config.modules.clone(),
+            config: bar_config,
         }
     }
 
@@ -157,8 +159,7 @@ impl BarManager {
                     }
                 }
 
-                // Read battery metrics. Naming varies (BAT0, BAT1, ...)
-                // across hardware, so glob rather than hardcode.
+                // Read battery metrics
                 let mut battery_pct = None;
                 let mut battery_charging = false;
                 if let Some(bat_path) = find_battery() {
@@ -197,7 +198,8 @@ impl BarManager {
     /// only clones what's needed for that frame.
     pub fn visible_modules(&self) -> Vec<ResolvedModule> {
         let state = self.state.lock().unwrap();
-        self.modules
+        self.config
+            .modules
             .iter()
             .map(|module_config| {
                 let value = match module_config.module_type.clone() {

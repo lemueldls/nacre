@@ -22,6 +22,7 @@ image = "0.25"
 libc = "0.2"
 niri-ipc = { version = "26.4.0", optional = true }
 nix = { version = "0.31.3", features = ["fs", "process", "user"] }
+notify = "8.2.0"
 nucleo-matcher = "0.3.1"
 pam-sys = "1.0.0-alpha5"
 pollster = "1.0.1"
